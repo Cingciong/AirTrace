@@ -4,6 +4,8 @@ Complete PX4 Flight Log Analyzer
 Analyzes both fused and raw sensor data from .ulg log files
 """
 
+import argparse
+import os
 import sys
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -484,10 +486,24 @@ def export_all_data(ulog, output_dir):
 # ============================================================================
 
 def main():
-    # ---------------------------------------------------------------------
-    #                                LOG FILE PATH:
-    log_file = "logs/log_6.ulg"
-    # ---------------------------------------------------------------------
+    BASE_LOG_DIR = "../logs/"
+
+    parser = argparse.ArgumentParser(description="Process a log file.")
+    parser.add_argument('filename', help="Name of the .ulg log file in ../logs/ directory")
+
+    args = parser.parse_args()
+
+    # Build the full file path
+    log_file = os.path.join(BASE_LOG_DIR, args.filename)
+
+    # Check if file exists
+    if not os.path.isfile(log_file):
+        print(f"Error: File '{args.filename}' not found in {BASE_LOG_DIR}")
+        print("Usage: program_name.py filename.ulg")
+        print(f"Place the file inside the '{BASE_LOG_DIR}' directory.")
+        sys.exit(1)
+
+    print(f"Using log file: {log_file}")
 
     if not Path(log_file).exists():
         print(f"Error: Log file not found: {log_file}")
@@ -496,7 +512,7 @@ def main():
     # Create output directory
     log_path = Path(log_file)
     log_name = log_path.stem
-    output_dir = Path(f"{log_name}_complete_analysis")
+    output_dir = Path(f"../{log_name}_complete_analysis")
     output_dir.mkdir(exist_ok=True)
     print(f"\n📁 Output directory: {output_dir.absolute()}")
 
