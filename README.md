@@ -1,4 +1,4 @@
-Data analysis guide: [PX4 Flight Log Analyzer](PX4_ANALYSIS.md)
+Data analysis guide: [PX4 Flight Log Analyzer](PX4_ANALYSIS.md) \
 Data analysis guide: [Gazebo simulation recording view from camera](video_recording.md)
 
 # PX4 with Gazebo and QGroundControl Installation Guide for Linux Mint and Ubuntu
@@ -92,3 +92,5 @@ make px4_sitl gz_x500_vision
 ~/Downloads/QGroundControl.AppImage
 ```
 4. QGroundControl will automatically connect to the simulation.
+
+5. Useful video on how to use QGroundcontrol: https://www.youtube.com/watch?v=0d23O_RUOmI
