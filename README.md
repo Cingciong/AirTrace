@@ -1,4 +1,5 @@
 Data analysis guide: [PX4 Flight Log Analyzer](PX4_ANALYSIS.md)
+Data analysis guide: [Gazebo simulation recording view from camera](video_recording.md)
 
 # PX4 with Gazebo and QGroundControl Installation Guide for Linux Mint and Ubuntu
 This guide provides clear, step-by-step instructions for installing PX4 Autopilot along with Gazebo simulator and QGroundControl for use on Linux Mint and Ubuntu systems. It also includes instructions on creating executable files for drone simulation with multiple sensors.
