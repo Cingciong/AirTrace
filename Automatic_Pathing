@@ -1,0 +1,68 @@
+import asyncio
+from mavsdk import System
+
+async def main():
+    drone = System()
+    await drone.connect(system_address="udp://:14540")
+
+    print("Waiting for drone...")
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print("Drone connected!")
+            break
+
+    print("Waiting for global position…")
+    async for health in drone.telemetry.health():
+        if health.is_global_position_ok:
+            print("Global position OK!")
+            break
+
+    # Get home position
+    async for position in drone.telemetry.position():
+        home_lat = position.latitude_deg
+        home_lon = position.longitude_deg
+        home_alt = position.absolute_altitude_m
+        print(f"Home: {home_lat}, {home_lon}, {home_alt}")
+        break
+
+    # Automatically generate a square path
+    size = 0.0001   # ≈ 11 meters
+    waypoints = [
+        (home_lat + size, home_lon + size, 10),
+        (home_lat + size, home_lon - size, 10),
+        (home_lat - size, home_lon - size, 10),
+        (home_lat - size, home_lon + size, 10)
+    ]
+
+    from mavsdk.mission import MissionItem, MissionPlan
+
+    mission_items = []
+    for lat, lon, alt in waypoints:
+        mission_items.append(
+            MissionItem(lat, lon, alt,
+                        speed_m_s=5,
+                        is_fly_through=True,
+                        gimbal_pitch_deg=0,
+                        gimbal_yaw_deg=0,
+                        camera_action=MissionItem.CameraAction.NONE)
+        )
+
+    mission_plan = MissionPlan(mission_items)
+
+    print("Uploading mission...")
+    await drone.mission.upload_mission(mission_plan)
+
+    print("Arming…")
+    await drone.action.arm()
+
+    print("Starting mission…")
+    await drone.mission.start_mission()
+
+    # Wait until finished
+    async for mission_progress in drone.mission.mission_progress():
+        print(f"Mission progress: {mission_progress}")
+        if mission_progress.current == mission_progress.total:
+            print("Mission completed!")
+            break
+
+asyncio.run(main())
