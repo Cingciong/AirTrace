@@ -1,0 +1,32 @@
+# ======================
+# IDE / Editor
+# ======================
+.idea/
+.vscode/
+
+# ======================
+# Python
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+
+# ======================
+# Data / Large files
+# ======================
+*.mp4
+*.mov
+*.MOV
+*.ulg
+*.csv
+
+# Ignore all data folders
+data/
+sim/data/
+ground_testing/videos/
+
+# ======================
+# OS
+# ======================
+.DS_Store
+Thumbs.db
