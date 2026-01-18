@@ -32,7 +32,6 @@ class TelemetryVideoSync:
         self.save_every_n = save_every_n
         self.plot_every_n = plot_every_n
 
-        self.all_frames = None
         self.frames = None
         self.gps_alt = None
         self.gps_time = None
