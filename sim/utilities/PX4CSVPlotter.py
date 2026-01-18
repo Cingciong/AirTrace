@@ -185,10 +185,45 @@ class PX4CSVPlotter:
 
     def plot_gps(self, plot=True):
         df = self._load_csv("sensor_gps_0.csv")
+
         time = df["time"].to_numpy()
         lon = df["longitude_deg"].to_numpy()
         lat = df["latitude_deg"].to_numpy()
         alt = df["altitude_msl_m"].to_numpy()
+
+        # Earth radius approx in meters
+        R = 6378137.0
+
+        # Convert to radians
+        lat_rad = np.deg2rad(lat)
+        lon_rad = np.deg2rad(lon)
+
+        # Reference point (first GPS)
+        lat0 = lat_rad[0]
+        lon0 = lon_rad[0]
+
+        # Approx meters conversion (local tangent plane)
+        x = (lon_rad - lon0) * R * np.cos(lat0)  # east-west
+        y = (lat_rad - lat0) * R  # north-south
+
+        # Now x, y are in meters relative to start point
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(6, 6))
+        plt.plot(x, y)
+        plt.title("GPS Path (meters)")
+        plt.xlabel("East (m)")
+        plt.ylabel("North (m)")
+        plt.grid(True)
+        plt.show()
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(time, alt)
+        plt.title("Altitude over time")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Altitude (m)")
+        plt.grid(True)
+        plt.show()
 
         if plot:
             fig, axes = plt.subplots(2, 1, figsize=(14, 8))
@@ -205,7 +240,6 @@ class PX4CSVPlotter:
             plt.tight_layout()
             plt.show()
 
-        return time, lon, lat, alt
 
     @staticmethod
     def quat_to_euler(q0, q1, q2, q3):
