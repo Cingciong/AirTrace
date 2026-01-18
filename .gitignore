@@ -19,6 +19,7 @@ __pycache__/
 *.MOV
 *.ulg
 *.csv
+*.pkl
 
 # Ignore all data folders
 data/
