@@ -4,6 +4,7 @@ import os
 import cv2
 import numpy as np
 from utilities.PX4CSVPlotter import PX4CSVPlotter
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
@@ -39,31 +40,26 @@ class TelemetryVideoSync:
         self.pitch = None
         self.roll = None
 
-
-
     def read_telemetry(self):
         ulog = ULog(self.ulog_path)
 
-        for d in ulog.data_list:
-            df = pd.DataFrame(d.data)
-            print(d.name)
-
         MONITOR_CSV = [
             "vehicle_attitude",
-            "sensor_accel_0.csv",
-            "sensor_gyro_0.csv",
-            "sensor_mag_0.csv",
-            "sensor_baro_0.csv",
-            "sensor_gps_0.csv",
-            "vehicle_local_position_0.csv",
-            "vehicle_global_position_0.csv"
+            "sensor_accel",
+            "sensor_gyro",
+            "sensor_mag",
+            "sensor_baro",
+            "sensor_gps",
+            "vehicle_local_position",
+            "vehicle_global_position"
         ]
+
+        os.makedirs(self.csv_path, exist_ok=True)
 
         for data in ulog.data_list:
             if data.name in MONITOR_CSV:
                 df = pd.DataFrame(data.data)
 
-                # Convert PX4 timestamp to seconds
                 if "timestamp" in df.columns:
                     df["timestamp_s"] = df["timestamp"] * 1e-6
 
@@ -108,14 +104,18 @@ class TelemetryVideoSync:
 
     def load_telemetry(self):
         plotter = PX4CSVPlotter(self.csv_path)
-
         all_data = plotter.plot_all(plot=False)
 
         angles = all_data["att"]
-        gps = all_data["gps"]
 
-        gps_time, gps_lon, gps_lat, gps_alt = gps
-        gps_alt = np.array(gps_alt)
+        # READ GPS DIRECTLY
+        gps_path = os.path.join(self.csv_path, "sensor_gps_0.csv")
+        gps = pd.read_csv(gps_path)
+
+        gps_time = gps["timestamp_s"].to_numpy()
+        gps_lon = gps["longitude_deg"].to_numpy()
+        gps_lat = gps["latitude_deg"].to_numpy()
+        gps_alt = gps["altitude_msl_m"].to_numpy()
 
         yaw_att = np.array(angles[0])
         pitch_att = np.array(angles[1])
@@ -155,6 +155,7 @@ class TelemetryVideoSync:
         gps_time, yaw_norm, pitch_norm, roll_norm, gps_alt = self.load_telemetry()
 
         frames = self.save_video_to_arrays()
+
         self.frames = frames[int(self.video_start_time * self.fps):int(self.video_end_time * self.fps)]
 
         gps_time_cut = gps_time[self.telemetry_start_idx:self.telemetry_end_idx]
@@ -236,6 +237,59 @@ class TelemetryVideoSync:
         print("Start time (s):", start_time)
         print("End time (s):", end_time)
         print("Duration (s):", end_time - start_time)
+
+    def debug_select_window_all(self):
+        # Load telemetry
+        gps_time, yaw_norm, pitch_norm, roll_norm, gps_alt = self.load_telemetry()
+
+        # Ensure all arrays are same length
+        n = min(len(gps_time), len(yaw_norm), len(pitch_norm), len(roll_norm), len(gps_alt))
+        gps_time = gps_time[:n]
+        yaw_norm = yaw_norm[:n]
+        pitch_norm = pitch_norm[:n]
+        roll_norm = roll_norm[:n]
+        gps_alt = gps_alt[:n]
+
+        # Plot everything on the same time axis
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        ax.plot(gps_time, gps_alt, label="Altitude (m)")
+        ax.plot(gps_time, pitch_norm, label="Pitch (deg)")
+        ax.plot(gps_time, roll_norm, label="Roll (deg)")
+        ax.plot(gps_time, yaw_norm, label="Yaw (deg)")
+
+        ax.set_title("Telemetry (click 2 points to select time window)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Value")
+        ax.grid(True)
+        ax.legend()
+
+        points = []
+
+        def onclick(event):
+            if event.inaxes != ax:
+                return
+
+            points.append(event.xdata)
+            ax.axvline(event.xdata, color="red", linewidth=1.2)
+            fig.canvas.draw()
+
+            if len(points) == 2:
+                t_start, t_end = points
+                if t_start > t_end:
+                    t_start, t_end = t_end, t_start
+
+                idx_start = int(np.searchsorted(gps_time, t_start))
+                idx_end = int(np.searchsorted(gps_time, t_end))
+
+                print(f"START TIME: {t_start:.2f} s (idx {idx_start})")
+                print(f"END TIME:   {t_end:.2f} s (idx {idx_end})")
+                print(f"DURATION:   {t_end - t_start:.2f} s")
+
+                plt.close(fig)
+
+        fig.canvas.mpl_connect("button_press_event", onclick)
+        plt.show()
 
     def play_telemetry_video(self, window_name="Telemetry Video"):
 
