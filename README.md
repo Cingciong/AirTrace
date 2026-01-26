@@ -640,19 +640,3 @@ ModuleNotFoundError: No module named 'mavsdk'
 ```bash
 pip install mavsdk
 ```
-
-## License
-
-[Specify your license here]
-
-## Contributing
-
-[Specify contribution guidelines here]
-
-## Authors
-
-[Specify authors here]
-
----
-
-**Note:** This system is designed for simulation environments. For real drone deployment, additional safety checks and fail-safes must be implemented.
