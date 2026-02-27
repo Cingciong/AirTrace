@@ -1,0 +1,26 @@
+Aktualna wersja kodu to wersja_finalna.py
+Obsługa:
+1) pobieramy plik pythona
+2) klikamy zielony trójkącik 
+3) czekamy aż nagra wszystkie dane i zapisze je w folderze
+4) sukces 
+
+W razie gdyby nie działało/nie odpalało podglądu w gazebo
+
+- odpalić px4 komendą, żeby sprawdzić czy działa
+cd ~/PX4-Autopilot
+make px4_sitl gz_x500_mono_cam_down_baylands
+
+- jeśli nie ma podglądu w gazeebo ALE w teminalu pokazują się wiadomości typu 
+  "Loop 2/2
+  Start: (+0m E, +0m N) yaw=0 deg
+  Point 1 (E): (+250m E, +0m N) yaw=90 deg"
+To kod DZIAŁA i trzeba poczekać aż skończy.
+
+
+Aktualna wersja deafultowo odpala misje lecenia po kwadracie, dron wznosi się na 50m,
+czeka a następnie leci do następnego punkt, kiedy doleci to zwalnia i czeka na ustabilizowanie się przed kontynuowaniem trasy.
+Jest to misja wolna, w kodzie można zmienić wysokość, długość boków kwadratu, częstotliwość pobierania danych telemetrycznych, maksymalną prędkość i czas czekania.
+
+TO DO:
+ - dalej jest offset pomiędzy nagraniem a talemetrią ale można go przeliczyć biorąc różnice długości trwania nagrania i timestampów.
