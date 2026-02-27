@@ -5,6 +5,7 @@ Obsługa:
 3) czekamy aż nagra wszystkie dane i zapisze je w folderze
 4) sukces 
 
+Nagranie z lotu waży dość dużo (z tej misji 500MB) jeśli nie macie miejsca na dysku to zakomentójcie przetwarzanie z .mkv na .mp4 albo usuwajcie .mkv
 W razie gdyby nie działało/nie odpalało podglądu w gazebo
 
 - odpalić px4 komendą, żeby sprawdzić czy działa
