@@ -7,19 +7,88 @@ import signal
 import time
 import math
 import csv
-import json
 import shutil
-from datetime import datetime
+import json
+import threading
 from contextlib import suppress
 
 from mavsdk import System
 from mavsdk.gimbal import GimbalMode
+from mavsdk.action import ActionError
+
+from pymavlink import mavutil
+
+
+class RawBaroReader:
+    """
+    Odczyt RAW barometru z MAVLink:
+    - SCALED_PRESSURE.press_abs (hPa)
+    """
+    def __init__(self, connection_str: str = "udpin:0.0.0.0:14540"):
+        self.connection_str = connection_str
+        self._mav = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+        self.latest_press_hpa = None
+        self.latest_press_time = None
+        self.connected = False
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        with suppress(Exception):
+            if self._mav:
+                self._mav.close()
+
+    def get_latest_pressure_hpa(self):
+        with self._lock:
+            return self.latest_press_hpa, self.latest_press_time
+
+    def _run(self):
+        try:
+            self._mav = mavutil.mavlink_connection(self.connection_str)
+            self._mav.wait_heartbeat(timeout=15)
+            self.connected = True
+
+            # Poproś autopilota o stream SCALED_PRESSURE ~30Hz
+            with suppress(Exception):
+                self._mav.mav.command_long_send(
+                    self._mav.target_system,
+                    self._mav.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    mavutil.mavlink.MAVLINK_MSG_ID_SCALED_PRESSURE,
+                    33333,  # us -> 30 Hz
+                    0, 0, 0, 0, 0
+                )
+
+            while not self._stop.is_set():
+                msg = self._mav.recv_match(type=["SCALED_PRESSURE"], blocking=True, timeout=0.5)
+                if msg is None:
+                    continue
+
+                press_hpa = float(msg.press_abs)
+                now_t = time.time()
+
+                with self._lock:
+                    self.latest_press_hpa = press_hpa
+                    self.latest_press_time = now_t
+
+        except Exception:
+            self.connected = False
 
 
 class DroneRecorder:
     def __init__(self, px4_path="~/PX4-Autopilot", output_dir="mission_data"):
         self.px4_path = os.path.expanduser(px4_path)
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.timestamp = time.strftime("%Y%m%d_%H%M%S")
 
         self.output_dir = f"{output_dir}_{self.timestamp}"
         os.makedirs(self.output_dir, exist_ok=True)
@@ -27,32 +96,29 @@ class DroneRecorder:
         self.video_mkv = os.path.join(self.output_dir, f"video_{self.timestamp}.mkv")
         self.video_mp4 = os.path.join(self.output_dir, f"mission_{self.timestamp}.mp4")
         self.telemetry_csv = os.path.join(self.output_dir, f"telemetry_{self.timestamp}.csv")
-        self.telemetry_json = os.path.join(self.output_dir, f"telemetry_{self.timestamp}.json")
-        self.mission_log = os.path.join(self.output_dir, f"mission_{self.timestamp}.log")
         self.summary_file = os.path.join(self.output_dir, f"summary_{self.timestamp}.txt")
 
         self.px4_process = None
         self.gst_process = None
 
         self.telemetry_data = []
-        self.mission_events = []
 
-        # [ZMIANA 1] Wspólny zegar dla video + telemetry
-        self.mission_t0 = None
+        self.video_t0_wall = None
+        self.mission_start_ts = None
+        self.mission_end_ts = None
 
         print(f"Data directory: {self.output_dir}/")
 
-    def log_event(self, event: str):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        self.mission_events.append(f"[{timestamp}] {event}")
+    def start_mission_window(self):
+        if self.mission_start_ts is None:
+            self.mission_start_ts = time.time()
+
+    def end_mission_window(self):
+        if self.mission_end_ts is None:
+            self.mission_end_ts = time.time()
 
     def start_px4(self):
-        """
-        Start PX4 SITL. Removed 'make distclean' to avoid long rebuilds and failures.
-        Shows PX4 output to help debugging.
-        """
         print("Starting PX4 simulation...")
-
         self.px4_process = subprocess.Popen(
             ["make", "px4_sitl", "gz_x500_mono_cam_down_baylands"],
             cwd=self.px4_path,
@@ -62,17 +128,12 @@ class DroneRecorder:
             bufsize=1,
             env={**os.environ, "ROS_DISTRO": "", "ROS_VERSION": ""},
         )
-
-        self.log_event("PX4 process started")
-
         print("Waiting ~25s for PX4 to boot...")
         time.sleep(25)
-        print("PX4 should be ready (if it booted successfully).")
-        self.log_event("PX4 boot wait finished")
+        print("PX4 should be ready.")
 
     def start_recording(self):
         print(f"Starting video recording: {self.video_mkv}")
-
         gst_cmd = [
             "gst-launch-1.0", "-e",
             "udpsrc", "port=5600", "buffer-size=2000000",
@@ -82,108 +143,90 @@ class DroneRecorder:
             "!", "matroskamux",
             "!", "filesink", f"location={self.video_mkv}", "sync=false"
         ]
-
-        self.gst_process = subprocess.Popen(
-            gst_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-        # [ZMIANA 2] Ustalamy "czas 0" przy starcie nagrywania
-        self.mission_t0 = time.time()
-
+        self.gst_process = subprocess.Popen(gst_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.video_t0_wall = time.time()
         time.sleep(2)
         print("Video recording started")
-        self.log_event("Video recording started")
 
     def save_telemetry_point(self, data: dict):
         self.telemetry_data.append(data)
 
+    def _trim_to_mission_window(self):
+        if self.mission_start_ts is None or self.mission_end_ts is None:
+            return
+        self.telemetry_data = [
+            d for d in self.telemetry_data
+            if self.mission_start_ts <= d["_wall_time"] <= self.mission_end_ts
+        ]
+
+    def _drop_internal_fields(self):
+        for d in self.telemetry_data:
+            d.pop("_wall_time", None)
+
+    def _get_media_duration_seconds(self, media_path: str):
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe or not os.path.exists(media_path):
+            return None
+        cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", media_path]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+            dur = float(data["format"]["duration"])
+            return dur if dur > 0 else None
+        except Exception:
+            return None
+
+    def _resync_csv_timestamp_to_media_duration(self, media_path: str):
+        if not self.telemetry_data:
+            return
+        media_duration = self._get_media_duration_seconds(media_path)
+        if media_duration is None:
+            return
+        last_csv = self.telemetry_data[-1]["timestamp"]
+        if last_csv <= 0:
+            return
+        scale = media_duration / last_csv
+        for row in self.telemetry_data:
+            row["timestamp"] *= scale
+
     def save_all_data(self):
+        self._trim_to_mission_window()
+        self._drop_internal_fields()
+
         if self.telemetry_data:
             print(f"Saving telemetry CSV: {self.telemetry_csv}")
+            fieldnames = [
+                "timestamp",
+                "sensor_accelx",
+                "sensor_accely",
+                "sensor_accelz",
+                "sensor_baro",        # RAW SCALED_PRESSURE.press_abs [hPa]
+                "sensor_gps_lat",
+                "sensor_gps_lon",
+                "sensor_gps_alt",
+                "sensor_gps_rel_alt",
+                "sensor_gyrox",
+                "sensor_gyroy",
+                "sensor_gyroz",
+                "sensor_magx",
+                "sensor_magy",
+                "sensor_magz",
+            ]
             with open(self.telemetry_csv, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self.telemetry_data[0].keys())
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(self.telemetry_data)
 
-            print(f"Saving telemetry JSON: {self.telemetry_json}")
-            with open(self.telemetry_json, "w") as f:
-                json.dump(self.telemetry_data, f, indent=2)
-
-        print(f"Saving mission log: {self.mission_log}")
-        with open(self.mission_log, "w") as f:
-            f.write("\n".join(self.mission_events))
-
-        self.create_summary()
-
-    def create_summary(self):
-        print(f"Creating summary: {self.summary_file}")
-
-        total_points = len(self.telemetry_data)
-        duration = 0.0
-        max_altitude = 0.0
-        max_speed = 0.0
-        distance = 0.0
-
-        if self.telemetry_data:
-            start_time = self.telemetry_data[0]["timestamp"]
-            end_time = self.telemetry_data[-1]["timestamp"]
-            duration = float(end_time - start_time)
-
-            max_altitude = max(d["altitude_m"] for d in self.telemetry_data)
-            max_speed = max(d["ground_speed_ms"] for d in self.telemetry_data)
-
-            for i in range(1, len(self.telemetry_data)):
-                lat1 = math.radians(self.telemetry_data[i - 1]["latitude"])
-                lon1 = math.radians(self.telemetry_data[i - 1]["longitude"])
-                lat2 = math.radians(self.telemetry_data[i]["latitude"])
-                lon2 = math.radians(self.telemetry_data[i]["longitude"])
-
-                dlat = lat2 - lat1
-                dlon = lon2 - lon1
-                a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-                c = 2 * math.asin(math.sqrt(a))
-                distance += 6371000 * c
-
         with open(self.summary_file, "w") as f:
-            f.write("=" * 60 + "\n")
-            f.write("MISSION SUMMARY - SQUARE PATTERN\n")
-            f.write("=" * 60 + "\n\n")
-            f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Directory: {self.output_dir}\n\n")
-
-            f.write("FILES:\n")
-            f.write(f"  Video MKV: {os.path.basename(self.video_mkv)}\n")
-            f.write(f"  Video MP4: {os.path.basename(self.video_mp4)}\n")
-            f.write(f"  Telemetry CSV: {os.path.basename(self.telemetry_csv)}\n")
-            f.write(f"  Telemetry JSON: {os.path.basename(self.telemetry_json)}\n")
-            f.write(f"  Mission log: {os.path.basename(self.mission_log)}\n\n")
-
-            f.write("STATISTICS:\n")
-            f.write(f"  Duration: {duration:.1f} s\n")
-            f.write(f"  Telemetry points: {total_points}\n")
-            f.write(f"  Max altitude: {max_altitude:.2f} m\n")
-            f.write(f"  Max speed: {max_speed:.2f} m/s\n")
-            f.write(f"  Distance: {distance:.2f} m\n\n")
-
-            f.write("EVENTS:\n")
-            for event in self.mission_events:
-                f.write(f"  {event}\n")
-
-        print("\n" + "=" * 60)
-        print("MISSION SUMMARY")
-        print("=" * 60)
-        print(f"Duration: {duration:.1f}s")
-        print(f"Points: {total_points}")
-        print(f"Max altitude: {max_altitude:.2f}m")
-        print(f"Max speed: {max_speed:.2f}m/s")
-        print(f"Distance: {distance:.2f}m")
-        print("=" * 60)
+            f.write("MISSION SUMMARY\n")
+            if self.telemetry_data:
+                duration = self.telemetry_data[-1]["timestamp"] - self.telemetry_data[0]["timestamp"]
+                f.write(f"Duration: {duration:.2f}s\n")
+                f.write(f"Points: {len(self.telemetry_data)}\n")
 
     def stop_all(self):
         print("\nStopping recording and PX4...")
-        self.log_event("Mission ended")
+        self.end_mission_window()
 
         if self.gst_process:
             with suppress(Exception):
@@ -191,112 +234,103 @@ class DroneRecorder:
             time.sleep(1)
             with suppress(Exception):
                 self.gst_process.terminate()
-            self.log_event("Video recording stopped")
 
         if self.px4_process:
             with suppress(Exception):
                 self.px4_process.terminate()
             time.sleep(2)
-            self.log_event("PX4 stopped")
 
-        self.save_all_data()
-
-        print(f"Video saved: {self.video_mkv}")
-
+        converted_ok = False
         if os.path.exists(self.video_mkv):
             ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                print("ffmpeg not found, skipping conversion to mp4.")
-                self.log_event("ffmpeg missing; conversion skipped")
-                return
+            if ffmpeg:
+                result = subprocess.run(
+                    [ffmpeg, "-i", self.video_mkv, "-c", "copy", self.video_mp4, "-y"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                converted_ok = (result.returncode == 0 and os.path.exists(self.video_mp4))
 
-            print("Converting to MP4...")
-            result = subprocess.run(
-                [ffmpeg, "-i", self.video_mkv, "-c", "copy", self.video_mp4, "-y"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if result.returncode == 0:
-                print(f"MP4 saved: {self.video_mp4}")
-                self.log_event("Converted MKV -> MP4")
-            else:
-                print("ffmpeg conversion failed (see ffmpeg logs if enabled).")
-                self.log_event("ffmpeg conversion failed")
+        media_for_sync = self.video_mp4 if converted_ok else self.video_mkv
+        self._resync_csv_timestamp_to_media_duration(media_for_sync)
+        self.save_all_data()
 
 
-async def collect_telemetry_10hz(drone: System, recorder: DroneRecorder):
-    """
-    Stable approach: keep latest values from streams in background tasks (cache),
-    and log at fixed 10 Hz.
-    """
-    # [ZMIANA 3] Czekamy na wspólny czas startu
-    while recorder.mission_t0 is None:
-        await asyncio.sleep(0.01)
+async def set_telemetry_rates(drone: System):
+    with suppress(Exception):
+        await drone.telemetry.set_rate_position(30.0)
+    with suppress(Exception):
+        await drone.telemetry.set_rate_imu(30.0)
+    with suppress(Exception):
+        await drone.telemetry.set_rate_velocity_ned(30.0)
+    with suppress(Exception):
+        await drone.telemetry.set_rate_in_air(10.0)
 
-    latest = {"pos": None, "vel": None, "att": None, "bat": None}
+
+async def collect_telemetry_30hz(drone: System, recorder: DroneRecorder, baro_reader: RawBaroReader):
+    while recorder.video_t0_wall is None:
+        await asyncio.sleep(0.005)
+
+    latest = {"pos": None, "imu": None}
 
     async def watch_position():
         async for p in drone.telemetry.position():
             latest["pos"] = p
 
-    async def watch_velocity():
-        async for v in drone.telemetry.velocity_ned():
-            latest["vel"] = v
+    async def watch_imu():
+        async for i in drone.telemetry.imu():
+            latest["imu"] = i
 
-    async def watch_attitude():
-        async for a in drone.telemetry.attitude_euler():
-            latest["att"] = a
+    tasks = [asyncio.create_task(watch_position()), asyncio.create_task(watch_imu())]
 
-    async def watch_battery():
-        async for b in drone.telemetry.battery():
-            latest["bat"] = b
-
-    tasks = [
-        asyncio.create_task(watch_position()),
-        asyncio.create_task(watch_velocity()),
-        asyncio.create_task(watch_attitude()),
-        asyncio.create_task(watch_battery()),
-    ]
+    period = 1.0 / 30.0
+    next_tick = time.perf_counter()
 
     try:
         while True:
-            await asyncio.sleep(0.1)  # 10 Hz log rate
+            next_tick += period
+            sleep_for = next_tick - time.perf_counter()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+            else:
+                next_tick = time.perf_counter()
+
+            now_wall = time.time()
+            if recorder.mission_end_ts is not None and now_wall > recorder.mission_end_ts + 0.2:
+                break
 
             pos = latest["pos"]
+            imu = latest["imu"]
             if pos is None:
                 continue
 
-            vel = latest["vel"]
-            att = latest["att"]
-            bat = latest["bat"]
+            ts = now_wall - recorder.video_t0_wall
+            baro_hpa, baro_t = baro_reader.get_latest_pressure_hpa()
 
-            # [ZMIANA 4] Timestamp liczony od startu video
-            current_time = time.time() - recorder.mission_t0
+            # fallback gdy chwilowo brak RAW
+            if baro_hpa is None:
+                baro_hpa = float("nan")
 
-            ground_speed = 0.0
-            if vel:
-                ground_speed = math.sqrt(vel.north_m_s ** 2 + vel.east_m_s ** 2)
-
-            data = {
-                "timestamp": current_time,
-                "latitude": pos.latitude_deg,
-                "longitude": pos.longitude_deg,
-                "altitude_m": pos.relative_altitude_m,
-                "absolute_altitude_m": pos.absolute_altitude_m,
-                "ground_speed_ms": ground_speed,
-                "velocity_north_ms": vel.north_m_s if vel else 0.0,
-                "velocity_east_ms": vel.east_m_s if vel else 0.0,
-                "velocity_down_ms": vel.down_m_s if vel else 0.0,
-                "roll_deg": att.roll_deg if att else 0.0,
-                "pitch_deg": att.pitch_deg if att else 0.0,
-                "yaw_deg": att.yaw_deg if att else 0.0,
-                "battery_voltage": bat.voltage_v if bat else 0.0,
-                "battery_remaining": bat.remaining_percent if bat else 0.0,
-            }
-            recorder.save_telemetry_point(data)
+            recorder.save_telemetry_point({
+                "_wall_time": now_wall,
+                "timestamp": ts,
+                "sensor_accelx": imu.acceleration_frd.forward_m_s2 if imu else 0.0,
+                "sensor_accely": imu.acceleration_frd.right_m_s2 if imu else 0.0,
+                "sensor_accelz": imu.acceleration_frd.down_m_s2 if imu else 0.0,
+                "sensor_baro": baro_hpa,  # hPa
+                "sensor_gps_lat": pos.latitude_deg,
+                "sensor_gps_lon": pos.longitude_deg,
+                "sensor_gps_alt": pos.absolute_altitude_m,
+                "sensor_gps_rel_alt": pos.relative_altitude_m,
+                "sensor_gyrox": imu.angular_velocity_frd.forward_rad_s if imu else 0.0,
+                "sensor_gyroy": imu.angular_velocity_frd.right_rad_s if imu else 0.0,
+                "sensor_gyroz": imu.angular_velocity_frd.down_rad_s if imu else 0.0,
+                "sensor_magx": imu.magnetic_field_frd.forward_gauss if imu else 0.0,
+                "sensor_magy": imu.magnetic_field_frd.right_gauss if imu else 0.0,
+                "sensor_magz": imu.magnetic_field_frd.down_gauss if imu else 0.0,
+            })
 
     except asyncio.CancelledError:
-        # Normal on shutdown
         pass
     finally:
         for t in tasks:
@@ -304,13 +338,11 @@ async def collect_telemetry_10hz(drone: System, recorder: DroneRecorder):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# [ZMIANA 5] Helper: odległość Haversine
 def haversine_m(lat1_deg: float, lon1_deg: float, lat2_deg: float, lon2_deg: float) -> float:
     lat1 = math.radians(lat1_deg)
     lon1 = math.radians(lon1_deg)
     lat2 = math.radians(lat2_deg)
     lon2 = math.radians(lon2_deg)
-
     dlat = lat2 - lat1
     dlon = lon2 - lon1
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
@@ -318,7 +350,6 @@ def haversine_m(lat1_deg: float, lon1_deg: float, lat2_deg: float, lon2_deg: flo
     return 6371000 * c
 
 
-# [ZMIANA 6] Helper: czekanie aż dron doleci i wyhamuje
 async def wait_until_arrived_and_stable(
     drone: System,
     target_lat: float,
@@ -333,7 +364,6 @@ async def wait_until_arrived_and_stable(
 
     async for pos in drone.telemetry.position():
         vel = await drone.telemetry.velocity_ned().__anext__()
-
         dist_m = haversine_m(pos.latitude_deg, pos.longitude_deg, target_lat, target_lon)
         speed_ms = math.sqrt(vel.north_m_s ** 2 + vel.east_m_s ** 2 + vel.down_m_s ** 2)
 
@@ -347,71 +377,73 @@ async def wait_until_arrived_and_stable(
 
         if time.time() - start > timeout_s:
             return False
+    return False
+
+
+async def arm_with_retry(drone: System, retries: int = 8):
+    for attempt in range(1, retries + 1):
+        try:
+            await drone.action.arm()
+            return
+        except ActionError as e:
+            if attempt == retries:
+                raise e
+            await asyncio.sleep(2.0)
 
 
 async def fly_square_mission(recorder: DroneRecorder):
     drone = System()
-
-    # Fix deprecated scheme: use udpin://
-    recorder.log_event("Connecting MAVSDK (udpin://0.0.0.0:14540)")
     await drone.connect(system_address="udpin://0.0.0.0:14540")
 
     print("Waiting for drone connection...")
     async for state in drone.core.connection_state():
         if state.is_connected:
             print("Drone connected")
-            recorder.log_event("Drone connected")
             break
 
     print("Waiting for GPS...")
     async for health in drone.telemetry.health():
         if health.is_global_position_ok and health.is_home_position_ok:
             print("GPS ready")
-            recorder.log_event("GPS ready")
             break
+
+    await asyncio.sleep(2.0)
+    await set_telemetry_rates(drone)
+
+    # Start RAW baro reader
+    baro_reader = RawBaroReader(connection_str="udpin:0.0.0.0:14540")
+    baro_reader.start()
+    await asyncio.sleep(1.0)
 
     async for position in drone.telemetry.position():
         center_lat = position.latitude_deg
         center_lon = position.longitude_deg
         altitude_abs = position.absolute_altitude_m
         print(f"Square center: {center_lat:.6f}, {center_lon:.6f}")
-        recorder.log_event(f"Square center: {center_lat:.6f}, {center_lon:.6f}")
+        print(f"Initial rel alt (should be ~0): {position.relative_altitude_m:.3f} m")
         break
 
-    telemetry_task = asyncio.create_task(collect_telemetry_10hz(drone, recorder))
+    recorder.start_mission_window()
+    telemetry_task = asyncio.create_task(collect_telemetry_30hz(drone, recorder, baro_reader))
 
-    flight_altitude_rel = 50  # meters above home (relative)
-    side_length = 500          # meters
-    wait_time = 8             # seconds at each point
-    num_loops = 2
-
+    flight_altitude_rel = 50
+    side_length = 200
+    wait_time = 2
+    num_loops = 1
     flight_altitude_abs = altitude_abs + flight_altitude_rel
 
     print("Arming...")
-    await drone.action.arm()
-    recorder.log_event("Armed")
+    await arm_with_retry(drone)
 
-    print(f"Taking off to {flight_altitude_rel}m...")
     await drone.action.set_takeoff_altitude(flight_altitude_rel)
     await drone.action.takeoff()
-    recorder.log_event(f"Takeoff to {flight_altitude_rel}m")
     await asyncio.sleep(12)
-    recorder.log_event("Takeoff completed")
 
-    # Optional: set max speed to make waits more meaningful
     with suppress(Exception):
-        await drone.action.set_maximum_speed(8.0)  # m/s
-        recorder.log_event("Set maximum speed to 8 m/s")
-
-    try:
+        await drone.action.set_maximum_speed(10.0)
+    with suppress(Exception):
         await drone.gimbal.set_mode(GimbalMode.YAW_FOLLOW)
         await drone.gimbal.set_pitch_and_yaw(-90, 0)
-        recorder.log_event("Camera pointing down (-90 deg)")
-        print("Camera pointing down")
-    except Exception as e:
-        recorder.log_event(f"Gimbal unavailable: {e}")
-
-    await asyncio.sleep(2)
 
     lat_per_meter = 1 / 111000
     lon_per_meter = 1 / (111000 * math.cos(math.radians(center_lat)))
@@ -427,84 +459,38 @@ async def fly_square_mission(recorder: DroneRecorder):
         {"name": "Return", "x": 0, "y": 0, "yaw": 0},
     ]
 
-    print(f"\nSquare mission: alt_rel={flight_altitude_rel}m, side={side_length}m, loops={num_loops}")
-    recorder.log_event(f"Square mission: {num_loops} loops, side={side_length}m, alt_rel={flight_altitude_rel}m")
-
     try:
-        for loop in range(num_loops):
-            print(f"\nLoop {loop + 1}/{num_loops}")
-            recorder.log_event(f"Starting square loop {loop + 1}/{num_loops}")
-
+        for _ in range(num_loops):
             for point in square_points:
-                lat_offset = point["y"] * lat_per_meter
-                lon_offset = point["x"] * lon_per_meter
-
-                target_lat = center_lat + lat_offset
-                target_lon = center_lon + lon_offset
-                yaw = point["yaw"]
-
-                print(f"  {point['name']}: ({point['x']:+.0f}m E, {point['y']:+.0f}m N) yaw={yaw} deg")
-                recorder.log_event(f"Waypoint: {point['name']} at ({point['x']:+.1f}, {point['y']:+.1f}) m")
-
-                await drone.action.goto_location(target_lat, target_lon, flight_altitude_abs, yaw)
-
-                # [ZMIANA 7] Najpierw dojazd + wyhamowanie, potem pauza
-                arrived = await wait_until_arrived_and_stable(
-                    drone,
-                    target_lat,
-                    target_lon,
-                    pos_tolerance_m=2.0,
-                    speed_tolerance_ms=0.8,
-                    stable_time_s=1.5,
-                    timeout_s=60.0,
-                )
-                recorder.log_event(f"{point['name']} reached_and_stable={arrived}")
-
+                target_lat = center_lat + point["y"] * lat_per_meter
+                target_lon = center_lon + point["x"] * lon_per_meter
+                await drone.action.goto_location(target_lat, target_lon, flight_altitude_abs, point["yaw"])
+                await wait_until_arrived_and_stable(drone, target_lat, target_lon)
                 await asyncio.sleep(wait_time)
 
-        recorder.log_event("All square loops completed")
-
-        print("\nReturning to center...")
         await drone.action.goto_location(center_lat, center_lon, flight_altitude_abs, 0)
-        recorder.log_event("Final return to home position")
         await asyncio.sleep(10)
-
-        print("Landing...")
         await drone.action.land()
-        recorder.log_event("Landing started")
 
         async for is_in_air in drone.telemetry.in_air():
             if not is_in_air:
-                print("Landed")
-                recorder.log_event("Landed successfully")
                 break
-
-        print("Mission completed")
-
     finally:
+        recorder.end_mission_window()
         telemetry_task.cancel()
         await asyncio.gather(telemetry_task, return_exceptions=True)
+        baro_reader.stop()
 
 
 async def main():
-    recorder = DroneRecorder(
-        px4_path="~/PX4-Autopilot",
-        output_dir="mission_data"
-    )
-
+    recorder = DroneRecorder(px4_path="~/PX4-Autopilot", output_dir="mission_data")
     try:
         recorder.start_px4()
         recorder.start_recording()
         await fly_square_mission(recorder)
-
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-        recorder.log_event("Mission interrupted by user")
     except Exception as e:
         print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        recorder.log_event(f"Error: {e}")
+        recorder.end_mission_window()
     finally:
         recorder.stop_all()
         print(f"\nAll data saved in: {recorder.output_dir}/")
