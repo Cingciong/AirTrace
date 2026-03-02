@@ -21,10 +21,10 @@ from pymavlink import mavutil
 
 class RawBaroReader:
     """
-    Odczyt RAW barometru z MAVLink:
-    - SCALED_PRESSURE.press_abs (hPa)
+    RAW barometr z MAVLink SCALED_PRESSURE.press_abs [hPa].
+    Słucha na OSOBNYM porcie (14550), żeby nie kolidować z MAVSDK (14540).
     """
-    def __init__(self, connection_str: str = "udpin:0.0.0.0:14540"):
+    def __init__(self, connection_str: str = "udpin:0.0.0.0:14550"):
         self.connection_str = connection_str
         self._mav = None
         self._thread = None
@@ -32,7 +32,6 @@ class RawBaroReader:
         self._lock = threading.Lock()
 
         self.latest_press_hpa = None
-        self.latest_press_time = None
         self.connected = False
 
     def start(self):
@@ -49,15 +48,14 @@ class RawBaroReader:
 
     def get_latest_pressure_hpa(self):
         with self._lock:
-            return self.latest_press_hpa, self.latest_press_time
+            return self.latest_press_hpa
 
     def _run(self):
         try:
             self._mav = mavutil.mavlink_connection(self.connection_str)
-            self._mav.wait_heartbeat(timeout=15)
+            self._mav.wait_heartbeat(timeout=30)
             self.connected = True
 
-            # Poproś autopilota o stream SCALED_PRESSURE ~30Hz
             with suppress(Exception):
                 self._mav.mav.command_long_send(
                     self._mav.target_system,
@@ -65,7 +63,7 @@ class RawBaroReader:
                     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                     0,
                     mavutil.mavlink.MAVLINK_MSG_ID_SCALED_PRESSURE,
-                    33333,  # us -> 30 Hz
+                    33333,  # µs -> ~30 Hz
                     0, 0, 0, 0, 0
                 )
 
@@ -73,13 +71,8 @@ class RawBaroReader:
                 msg = self._mav.recv_match(type=["SCALED_PRESSURE"], blocking=True, timeout=0.5)
                 if msg is None:
                     continue
-
-                press_hpa = float(msg.press_abs)
-                now_t = time.time()
-
                 with self._lock:
-                    self.latest_press_hpa = press_hpa
-                    self.latest_press_time = now_t
+                    self.latest_press_hpa = float(msg.press_abs)
 
         except Exception:
             self.connected = False
@@ -200,11 +193,10 @@ class DroneRecorder:
                 "sensor_accelx",
                 "sensor_accely",
                 "sensor_accelz",
-                "sensor_baro",        # RAW SCALED_PRESSURE.press_abs [hPa]
+                "sensor_baro",
                 "sensor_gps_lat",
                 "sensor_gps_lon",
                 "sensor_gps_alt",
-                "sensor_gps_rel_alt",
                 "sensor_gyrox",
                 "sensor_gyroy",
                 "sensor_gyroz",
@@ -286,6 +278,9 @@ async def collect_telemetry_30hz(drone: System, recorder: DroneRecorder, baro_re
     period = 1.0 / 30.0
     next_tick = time.perf_counter()
 
+    # trzymamy ostatnią dobrą wartość baro (nie nan)
+    last_good_baro = 1013.25
+
     try:
         while True:
             next_tick += period
@@ -305,11 +300,11 @@ async def collect_telemetry_30hz(drone: System, recorder: DroneRecorder, baro_re
                 continue
 
             ts = now_wall - recorder.video_t0_wall
-            baro_hpa, baro_t = baro_reader.get_latest_pressure_hpa()
 
-            # fallback gdy chwilowo brak RAW
-            if baro_hpa is None:
-                baro_hpa = float("nan")
+            baro_hpa = baro_reader.get_latest_pressure_hpa()
+            if baro_hpa is not None:
+                last_good_baro = baro_hpa
+            baro_out = last_good_baro
 
             recorder.save_telemetry_point({
                 "_wall_time": now_wall,
@@ -317,11 +312,10 @@ async def collect_telemetry_30hz(drone: System, recorder: DroneRecorder, baro_re
                 "sensor_accelx": imu.acceleration_frd.forward_m_s2 if imu else 0.0,
                 "sensor_accely": imu.acceleration_frd.right_m_s2 if imu else 0.0,
                 "sensor_accelz": imu.acceleration_frd.down_m_s2 if imu else 0.0,
-                "sensor_baro": baro_hpa,  # hPa
+                "sensor_baro": baro_out,
                 "sensor_gps_lat": pos.latitude_deg,
                 "sensor_gps_lon": pos.longitude_deg,
-                "sensor_gps_alt": pos.absolute_altitude_m,
-                "sensor_gps_rel_alt": pos.relative_altitude_m,
+                "sensor_gps_alt": pos.relative_altitude_m,
                 "sensor_gyrox": imu.angular_velocity_frd.forward_rad_s if imu else 0.0,
                 "sensor_gyroy": imu.angular_velocity_frd.right_rad_s if imu else 0.0,
                 "sensor_gyroz": imu.angular_velocity_frd.down_rad_s if imu else 0.0,
@@ -410,10 +404,12 @@ async def fly_square_mission(recorder: DroneRecorder):
     await asyncio.sleep(2.0)
     await set_telemetry_rates(drone)
 
-    # Start RAW baro reader
-    baro_reader = RawBaroReader(connection_str="udpin:0.0.0.0:14540")
+    # pymavlink na OSOBNYM porcie 14550
+    print("Starting raw baro reader on port 14550...")
+    baro_reader = RawBaroReader(connection_str="udpin:0.0.0.0:14550")
     baro_reader.start()
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(2.0)
+    print(f"Baro reader connected: {baro_reader.connected}")
 
     async for position in drone.telemetry.position():
         center_lat = position.latitude_deg
