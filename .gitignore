@@ -21,10 +21,13 @@ __pycache__/
 *.csv
 *.pkl
 
+
 # Ignore all data folders
 data/
 sim/data/
 ground_testing/videos/
+sim/Dataset_balanced/
+sim/Dataset_balanced.zip
 
 # ======================
 # OS
