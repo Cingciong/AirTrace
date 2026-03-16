@@ -24,6 +24,8 @@ __pycache__/
 data/
 sim/data/
 ground_testing/videos/
+sim/Dataset_balanced/
+sim/Dataset_balanced.zip
 
 # ======================
 # OS
