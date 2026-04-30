@@ -91,11 +91,6 @@ branch/
     dataset_norm.py
     dataset_val.py
     dataset_vis.py
-
-    figures/
-        hist.png
-        hist_balanced.png
-
     README.md
 ```
 
@@ -151,16 +146,6 @@ Dataset_balanced/
 ## dataset_val.py
 
 Generates validation plots used to verify dataset quality and altitude distribution.
-
-Example outputs:
-
-## Data samples histogram (raw)
-
-![Raw histogram](figures/hist.png)
-
-## Data samples histogram (balanced)
-
-![Balanced histogram](figures/hist_balanced.png)
 
 ---
 
