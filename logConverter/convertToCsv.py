@@ -1,56 +1,51 @@
 import os
-import re
+import json
+import subprocess
+import csv
+from tqdm import tqdm
 
-DATA_DIR = r"..\data"
-OUTPUT_DIR = r"..\data"
-SUBTITLE_PATTERN = r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "..", "data")
+OUTPUT_DIR = os.path.join(BASE_DIR, "..", "data")
+EXIFTOOL_COMMAND = "exiftool"
+EXIFTOOL_ARGS = ["-ee", "-G3", "-j"]
 
-def parseSrtToCsv():
-    for fileName in os.listdir(DATA_DIR):
-        if not fileName.lower().endswith(".srt"):
+def parseMp4ToCsv():
+    fileList = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".mp4")]
+
+    for fileName in tqdm(fileList, desc="Processing MP4 files"):
+        mp4Path = os.path.join(DATA_DIR, fileName)
+        csvPath = os.path.join(OUTPUT_DIR, fileName.lower().replace(".mp4", ".csv"))
+
+        runArgs = [EXIFTOOL_COMMAND] + EXIFTOOL_ARGS + [mp4Path]
+        result = subprocess.run(runArgs, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        try:
+            fullData = json.loads(result.stdout)
+        except json.JSONDecodeError:
             continue
 
-        srtPath = os.path.join(DATA_DIR, fileName)
-        csvPath = os.path.join(OUTPUT_DIR, fileName.lower().replace(".srt", ".csv"))
+        if not fullData:
+            continue
 
-        with open(srtPath, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        blocks = content.strip().split("\n\n")
         csvRows = []
-        allKeys = ["Target_Time"]
+        allKeysSet = set()
 
-        for block in blocks:
-            lines = [line.strip() for line in block.split("\n") if line.strip()]
-            if len(lines) < 3:
-                continue
-
-            timeMatch = re.match(SUBTITLE_PATTERN, lines[1])
-            if not timeMatch:
-                continue
-
-            startTime = timeMatch.group(1)
-            dataText = " ".join(lines[2:])
-            
-            rowDict = {"Target_Time": startTime}
-            
-            foundPairs = re.findall(r"([a-zA-Z_]+)\s*:\s*([^\]\s,\[]+)", dataText)
-            for key, val in foundPairs:
-                cleanKey = key.strip()
-                cleanVal = val.strip()
-                rowDict[cleanKey] = cleanVal
-                if cleanKey not in allKeys:
-                    allKeys.append(cleanKey)
-                    
-            if len(rowDict) > 1:
+        for item in fullData:
+            rowDict = {}
+            for key, val in item.items():
+                cleanKey = key.split(":")[-1]
+                rowDict[cleanKey] = str(val)
+                allKeysSet.add(cleanKey)
+            if rowDict:
                 csvRows.append(rowDict)
 
         if csvRows:
+            orderedKeys = sorted(list(allKeysSet))
             with open(csvPath, "w", newline="", encoding="utf-8") as f:
-                f.write(",".join(allKeys) + "\n")
-                for row in csvRows:
-                    rowValues = [row.get(key, "") for key in allKeys]
-                    f.write(",".join(rowValues) + "\n")
+                writer = csv.DictWriter(f, fieldnames=orderedKeys)
+                writer.writeheader()
+                writer.writerows(csvRows)
 
 if __name__ == "__main__":
-    parseSrtToCsv()
+    parseMp4ToCsv()
